@@ -17,6 +17,7 @@ from langchain_core.messages import (
     SystemMessage,
     HumanMessage,
     RemoveMessage,
+    ToolMessage,
 )
 from langchain_core.runnables import RunnableConfig
 
@@ -24,6 +25,8 @@ from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.store.postgres import PostgresStore
 from langgraph.store.base import BaseStore
+from langchain_community.tools import DuckDuckGoSearchRun
+
 
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 
@@ -59,6 +62,7 @@ setup_logging()
 log_memory = logging.getLogger("memory")
 log_retrieve = logging.getLogger("memory.retrieve")
 log_chat = logging.getLogger("chat")
+log_tools = logging.getLogger("tools")
 
 # ============================================================
 # CONFIG
@@ -79,6 +83,13 @@ chat_llm = ChatOllama(model="qwen2.5:7b")
 memory_llm = ChatOllama(model="qwen2.5:7b")
 
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
+
+# -------------------
+# 3. Tools
+# -------------------
+search_tool = DuckDuckGoSearchRun(region="us-en")
+
+tools = [search_tool]
 
 # ============================================================
 # PROMPTS
@@ -344,8 +355,44 @@ def chat_node(state: dict):
     system = SystemMessage(
         content=SYSTEM_PROMPT.format(context=state.get("merged_context") or "(empty)")
     )
-    response = chat_llm.invoke([system] + state["messages"])
+    chat_llm_with_tools = chat_llm.bind_tools(tools)
+    messages = [system] + state["messages"]
+    response = chat_llm_with_tools.invoke(messages)
     log_chat.debug("Assistant response generated")
+
+    tool_calls = getattr(response, "tool_calls", None)
+    if tool_calls:
+        tool_map = {t.name: t for t in tools}
+        tool_messages = []
+        for call in tool_calls:
+            name = call.get("name")
+            args = call.get("args") or {}
+            call_id = call.get("id")
+            log_tools.info("Tool call: name=%s args=%s", name, args)
+
+            tool = tool_map.get(name)
+            if not tool:
+                log_tools.error("Unknown tool requested: %s", name)
+                continue
+
+            # DuckDuckGoSearchRun expects a string query
+            tool_input = args.get("query") if isinstance(args, dict) else args
+            try:
+                result = tool.invoke(tool_input)
+                result_text = str(result)
+                log_tools.info(
+                    "Tool result (%s): %.200s", name, result_text.replace("\n", " ")
+                )
+                tool_messages.append(
+                    ToolMessage(content=result_text, tool_call_id=call_id, name=name)
+                )
+            except Exception as e:
+                log_tools.error("Tool execution failed (%s)", name, exc_info=e)
+
+        # Ask the model to produce a final answer using tool outputs
+        final = chat_llm_with_tools.invoke(messages + [response] + tool_messages)
+        return {"messages": [final]}
+
     return {"messages": [response]}
 
 
@@ -404,7 +451,12 @@ def main():
                 {"messages": [HumanMessage(content=text)]}, config=config
             )
 
-            print("\nAssistant:", out["messages"][-1].content)
+            assistant_msg = out["messages"][-1]
+            content = getattr(assistant_msg, "content", "") or ""
+            if content.strip():
+                print("\nAssistant:\n" + content.strip())
+            else:
+                print("\nAssistant:\n[No textual content; check logs for tool usage]")
             print("-" * 80)
 
 
