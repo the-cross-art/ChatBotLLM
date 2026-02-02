@@ -142,6 +142,7 @@ MAX_LTM_RESULTS = 5
 HYBRID_ALPHA = 0.6  # weight for vector similarity
 MEMORY_DECAY_LAMBDA = 0.05  # exponential decay per day
 MEMORY_PROMOTION_BOOST = 0.1  # boost when reconfirmed
+MIN_RAG_SCORE = 0.45  # minimum hybrid score to include a RAG chunk
 
 # ============================================================
 # MODELS
@@ -181,15 +182,6 @@ Rules:
 - Do NOT use external tools unless the user explicitly asks
 """
 
-RAG_ROUTER_PROMPT = """You are a routing assistant. Decide if the user's latest message requires retrieving external Knowledge Context (RAG).
-
-Guidelines:
-- Use RAG when the user asks factual or content questions not contained in User Memory or the ongoing conversation (e.g., job details, requirements, definitions, architecture, citations).
-- Do NOT use RAG for personal identity questions about the user (e.g., "my name", "who am i", "about me"). Prefer User Memory for those.
-- If unsure, lean towards not using RAG.
-
-Return your decision as a boolean field `use_rag` and a brief `reason`.
-"""
 
 MEMORY_PROMPT = """You are a memory extraction system. Your job is to identify important facts about the user.
 
@@ -239,14 +231,6 @@ class ChatState(MessagesState):
     retrieved_memories: List[str] = []
     rag_context: List[dict] = []
     merged_context: str = ""
-
-
-class RagDecision(BaseModel):
-    use_rag: bool
-    reason: str = ""
-
-
-rag_router = chat_llm.with_structured_output(RagDecision)
 
 
 memory_extractor = memory_llm.with_structured_output(MemoryDecision)
@@ -437,24 +421,10 @@ def should_summarize(state: dict):
     return decision
 
 
-def should_use_rag_llm(state: dict):
-    """Let the LLM decide whether to use RAG based on the last user message and context."""
-    q = state["messages"][-1].content if state.get("messages") else ""
-    ctx = state.get("merged_context") or ""
-    try:
-        decision = rag_router.invoke(
-            [
-                SystemMessage(content=RAG_ROUTER_PROMPT),
-                HumanMessage(content=f"Question: {q}\n\nContext:\n{ctx[:2000]}"),
-            ]
-        )
-        log_rag.info(
-            "RAG decision | use_rag=%s | reason=%s", decision.use_rag, decision.reason
-        )
-        return decision.use_rag
-    except Exception as e:
-        log_rag.error("RAG decision failed; defaulting to False", exc_info=e)
-        return False
+def route_retrieval_node(state: dict):
+    """Fan-out marker to run LTM and RAG retrieval in parallel before merging."""
+    log_chat.debug("Routing to parallel LTM and RAG retrieval")
+    return {}
 
 
 def retrieve_rag(state: ChatState, config: RunnableConfig, *, store: BaseStore):
@@ -489,7 +459,7 @@ def retrieve_rag(state: ChatState, config: RunnableConfig, *, store: BaseStore):
         if max_bm == 0.0:
             max_bm = 1.0
 
-        # Combine scores
+        # Combine scores and filter by minimum hybrid threshold
         combined = []
         for idx, vscore in vec_scores:
             v_norm = vscore / max_vec if max_vec > 0 else 0.0
@@ -497,7 +467,7 @@ def retrieve_rag(state: ChatState, config: RunnableConfig, *, store: BaseStore):
                 (bm_scores_list[idx] / max_bm) if idx < len(bm_scores_list) else 0.0
             )
             combo = HYBRID_ALPHA * v_norm + (1 - HYBRID_ALPHA) * b_norm
-            if vscore >= RAG_SIM_THRESHOLD or b_norm > 0.0:
+            if combo >= MIN_RAG_SCORE:
                 combined.append((combo, idx))
 
         combined.sort(reverse=True)
@@ -566,28 +536,17 @@ def merge_node(state: dict):
 
 
 def chat_node(state: dict):
-    def should_use_tools_for_query(text: str) -> bool:
-        t = (text or "").lower()
-        # Only enable tools for explicit web/external info requests
-        return any(
-            k in t
-            for k in ["search", "web", "online", "latest", "news", "trend", "lookup"]
-        )
-
     system = SystemMessage(
         content=SYSTEM_PROMPT.format(context=state.get("merged_context") or "(empty)")
     )
-    user_text = state["messages"][-1].content if state.get("messages") else ""
-
-    # Otherwise, decide tool availability heuristically
-    use_tools = should_use_tools_for_query(user_text)
-    chat_llm_with_tools = chat_llm.bind_tools(tools) if use_tools else chat_llm
+    # Always bind tools; let the LLM decide whether to call them
+    chat_llm_with_tools = chat_llm.bind_tools(tools)
     messages = [system] + state["messages"]
     response = chat_llm_with_tools.invoke(messages)
     log_chat.debug("Assistant response generated")
 
     tool_calls = getattr(response, "tool_calls", None)
-    if tool_calls and use_tools:
+    if tool_calls:
         tool_map = {t.name: t for t in tools}
         tool_messages = []
         for call in tool_calls:
@@ -664,13 +623,16 @@ builder.add_node("summarize", summarize_node)
 builder.add_node("retrieve_rag", retrieve_rag)
 builder.add_node("merge", merge_node)
 builder.add_node("chat", chat_node)
+builder.add_node("route_retrieval", route_retrieval_node)
 
 builder.add_edge(START, "remember")
 builder.add_conditional_edges(
-    "remember", should_summarize, {True: "summarize", False: "retrieve_ltm"}
+    "remember", should_summarize, {True: "summarize", False: "route_retrieval"}
 )
-builder.add_edge("summarize", "retrieve_ltm")
-builder.add_edge("retrieve_ltm", "retrieve_rag")
+builder.add_edge("summarize", "route_retrieval")
+builder.add_edge("route_retrieval", "retrieve_ltm")
+builder.add_edge("route_retrieval", "retrieve_rag")
+builder.add_edge("retrieve_ltm", "merge")
 builder.add_edge("retrieve_rag", "merge")
 builder.add_edge("merge", "chat")
 builder.add_edge("chat", END)
