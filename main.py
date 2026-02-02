@@ -7,9 +7,12 @@ import uuid
 import psycopg2
 import logging
 import sys
-from math import sqrt
+import os
+import re
+from math import sqrt, exp
 from typing import List
 from datetime import datetime, timezone
+from rank_bm25 import BM25Okapi
 
 from pydantic import BaseModel, Field
 
@@ -53,8 +56,20 @@ def setup_logging():
         "httpx",
         "urllib3",
         "asyncio",
+        "langsmith",
+        "langsmith.client",
     ]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # Explicitly disable LangSmith tracing if env vars are set
+    for k in [
+        "LANGCHAIN_TRACING_V2",
+        "LANGCHAIN_ENDPOINT",
+        "LANGCHAIN_API_KEY",
+        "LANGCHAIN_PROJECT",
+    ]:
+        if os.environ.get(k):
+            os.environ.pop(k, None)
 
 
 setup_logging()
@@ -63,6 +78,50 @@ log_memory = logging.getLogger("memory")
 log_retrieve = logging.getLogger("memory.retrieve")
 log_chat = logging.getLogger("chat")
 log_tools = logging.getLogger("tools")
+log_rag = logging.getLogger("rag")
+log_rag_retrieve = logging.getLogger("rag.retrieve")
+
+# ============================================================
+# RAG CACHE (BM25 + vectors)
+# ============================================================
+
+bm25_index = None
+bm25_corpus = []  # list[list[str]] tokenized
+rag_items_cache = []  # list[dict]: {chunk, embedding, source, doc_id, title, section}
+
+
+def _tokenize(text: str) -> List[str]:
+    return [t for t in re.split(r"[^A-Za-z0-9]+", text.lower()) if t]
+
+
+def load_rag_cache():
+    """Fetch all RAG items from dedicated store and prepare BM25 corpus."""
+    global bm25_index, bm25_corpus, rag_items_cache
+    from langgraph.store.postgres import PostgresStore
+
+    rag_items_cache = []
+    bm25_corpus = []
+
+    try:
+        with PostgresStore.from_conn_string(DB_URI_RAG) as rag_store:
+            rag_store.setup()
+            ns = ("rag", "global")
+            for it in rag_store.search(ns):
+                val = it.value
+                rag_items_cache.append(val)
+                bm25_corpus.append(_tokenize(val.get("chunk", "")))
+        if rag_items_cache:
+            bm25_index = BM25Okapi(bm25_corpus)
+            log_rag.info("Loaded RAG cache: %d items", len(rag_items_cache))
+        else:
+            bm25_index = None
+            log_rag.warning("RAG cache empty; ingestion required")
+    except Exception as e:
+        log_rag.error("Failed loading RAG cache", exc_info=e)
+        bm25_index = None
+        rag_items_cache = []
+        bm25_corpus = []
+
 
 # ============================================================
 # CONFIG
@@ -71,9 +130,18 @@ log_tools = logging.getLogger("tools")
 DB_URI_USERS = "postgresql://imrannazir@localhost:5432/user_registry"
 DB_URI_STM = "postgresql://imrannazir@localhost:5432/stm_persist"
 DB_URI_LTM = "postgresql://imrannazir@localhost:5432/ltm_persistence"
+DB_URI_RAG = "postgresql://imrannazir@localhost:5432/rag_knowledge"
+
+MAX_RAG_RESULTS = 4
+RAG_SIM_THRESHOLD = 0.75
 
 MEMORY_SIM_THRESHOLD = 0.92
 MAX_LTM_RESULTS = 5
+
+# Hybrid retrieval and memory tuning
+HYBRID_ALPHA = 0.6  # weight for vector similarity
+MEMORY_DECAY_LAMBDA = 0.05  # exponential decay per day
+MEMORY_PROMOTION_BOOST = 0.1  # boost when reconfirmed
 
 # ============================================================
 # MODELS
@@ -95,14 +163,32 @@ tools = [search_tool]
 # PROMPTS
 # ============================================================
 
-SYSTEM_PROMPT = """You are a helpful assistant with memory.
+SYSTEM_PROMPT = """You are a helpful assistant.
 
-Context:
+CONTEXT:
 {context}
 
+Context sections may include:
+- Conversation Summary (what has been discussed)
+- User Memory (facts about the user)
+- Knowledge Context (retrieved documents)
+
 Rules:
-- Use memory only if relevant
-- Do not invent facts
+- Prefer Knowledge Context for factual answers and citations
+- Use User Memory to answer personal questions about the user (e.g., name, role, experience)
+- If the answer is not present in Knowledge Context, say you are unsure
+- Do not fabricate details
+- Do NOT use external tools unless the user explicitly asks
+"""
+
+RAG_ROUTER_PROMPT = """You are a routing assistant. Decide if the user's latest message requires retrieving external Knowledge Context (RAG).
+
+Guidelines:
+- Use RAG when the user asks factual or content questions not contained in User Memory or the ongoing conversation (e.g., job details, requirements, definitions, architecture, citations).
+- Do NOT use RAG for personal identity questions about the user (e.g., "my name", "who am i", "about me"). Prefer User Memory for those.
+- If unsure, lean towards not using RAG.
+
+Return your decision as a boolean field `use_rag` and a brief `reason`.
 """
 
 MEMORY_PROMPT = """You are a memory extraction system. Your job is to identify important facts about the user.
@@ -151,7 +237,16 @@ class MemoryDecision(BaseModel):
 class ChatState(MessagesState):
     summary: str = ""
     retrieved_memories: List[str] = []
+    rag_context: List[dict] = []
     merged_context: str = ""
+
+
+class RagDecision(BaseModel):
+    use_rag: bool
+    reason: str = ""
+
+
+rag_router = chat_llm.with_structured_output(RagDecision)
 
 
 memory_extractor = memory_llm.with_structured_output(MemoryDecision)
@@ -274,17 +369,35 @@ def retrieve_ltm(state: ChatState, config: RunnableConfig, *, store: BaseStore):
     query = state["messages"][-1].content
     q_emb = embeddings.embed_query(query)
 
+    def effective_confidence(item_val):
+        c = float(item_val.get("confidence", 1.0))
+        last = item_val.get("last_confirmed") or item_val.get("created_at")
+        try:
+            t_last = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            days = max(
+                0.0, (datetime.now(timezone.utc) - t_last).total_seconds() / 86400.0
+            )
+            decay = exp(-MEMORY_DECAY_LAMBDA * days)
+        except Exception:
+            decay = 1.0
+        return max(0.0, min(1.0, c * decay))
+
     scored = []
     for it in store.search(ns):
-        score = cosine_similarity(q_emb, it.value["embedding"]) * it.value.get(
-            "confidence", 1.0
-        )
+        sim = cosine_similarity(q_emb, it.value["embedding"])  # approx 0..1
+        conf = effective_confidence(it.value)
+        # promotion boost when strongly matched by current query
+        if sim >= 0.9:
+            conf = min(1.0, conf + MEMORY_PROMOTION_BOOST)
+        score = sim * conf
         scored.append((score, it.value["text"]))
 
     scored.sort(reverse=True)
     top = [t for _, t in scored[:MAX_LTM_RESULTS]]
 
-    log_retrieve.debug("Retrieved memories: %s", top)
+    # Log query and fetched LTM items
+    log_retrieve.info("LTM query: %s", query)
+    log_retrieve.info("LTM fetched: %s", top)
 
     return {"retrieved_memories": top}
 
@@ -324,27 +437,128 @@ def should_summarize(state: dict):
     return decision
 
 
+def should_use_rag_llm(state: dict):
+    """Let the LLM decide whether to use RAG based on the last user message and context."""
+    q = state["messages"][-1].content if state.get("messages") else ""
+    ctx = state.get("merged_context") or ""
+    try:
+        decision = rag_router.invoke(
+            [
+                SystemMessage(content=RAG_ROUTER_PROMPT),
+                HumanMessage(content=f"Question: {q}\n\nContext:\n{ctx[:2000]}"),
+            ]
+        )
+        log_rag.info(
+            "RAG decision | use_rag=%s | reason=%s", decision.use_rag, decision.reason
+        )
+        return decision.use_rag
+    except Exception as e:
+        log_rag.error("RAG decision failed; defaulting to False", exc_info=e)
+        return False
+
+
+def retrieve_rag(state: ChatState, config: RunnableConfig, *, store: BaseStore):
+    if not state.get("messages"):
+        return {}
+
+    query = state["messages"][-1].content
+    q_emb = embeddings.embed_query(query)
+    try:
+        log_rag.info("RAG query: %s", query)
+        # Ensure cache is loaded from dedicated RAG store
+        if bm25_index is None or not rag_items_cache:
+            load_rag_cache()
+        if not rag_items_cache:
+            return {"rag_context": []}
+
+        # Vector similarities
+        vec_scores = []
+        for idx, item in enumerate(rag_items_cache):
+            sim = cosine_similarity(q_emb, item.get("embedding", []))
+            vec_scores.append((idx, max(0.0, sim)))
+        max_vec = max((s for _, s in vec_scores), default=1.0) or 1.0
+
+        # BM25 scores
+        q_tokens = [t for t in re.split(r"[^A-Za-z0-9]+", query.lower()) if t]
+        bm_scores_list = (
+            list(bm25_index.get_scores(q_tokens))
+            if bm25_index
+            else [0.0] * len(rag_items_cache)
+        )
+        max_bm = max(bm_scores_list) if bm_scores_list else 1.0
+        if max_bm == 0.0:
+            max_bm = 1.0
+
+        # Combine scores
+        combined = []
+        for idx, vscore in vec_scores:
+            v_norm = vscore / max_vec if max_vec > 0 else 0.0
+            b_norm = (
+                (bm_scores_list[idx] / max_bm) if idx < len(bm_scores_list) else 0.0
+            )
+            combo = HYBRID_ALPHA * v_norm + (1 - HYBRID_ALPHA) * b_norm
+            if vscore >= RAG_SIM_THRESHOLD or b_norm > 0.0:
+                combined.append((combo, idx))
+
+        combined.sort(reverse=True)
+        top_idxs = [i for _, i in combined[:MAX_RAG_RESULTS]]
+        top_items = [rag_items_cache[i] for i in top_idxs]
+
+        for i, val in enumerate(top_items):
+            log_rag_retrieve.info(
+                "RAG[%d]: src=%s title=%s section=%s",
+                i,
+                val.get("source"),
+                val.get("title"),
+                val.get("section"),
+            )
+
+        # Include metadata for citation grounding
+        ctx = [
+            {
+                "text": v.get("chunk", ""),
+                "source": v.get("source"),
+                "doc_id": v.get("doc_id"),
+                "title": v.get("title"),
+                "section": v.get("section"),
+            }
+            for v in top_items
+        ]
+        return {"rag_context": ctx}
+    except Exception as e:
+        log_rag.error("RAG retrieval failed", exc_info=e)
+        return {}
+
+
 def merge_node(state: dict):
     blocks = []
 
     summary = state.get("summary")
     memories = state.get("retrieved_memories")
+    rag_chunks = state.get("rag_context")
 
     if summary:
         log_chat.debug("Merging summary into context")
-        blocks.append(f"Summary:\n{summary}")
+        log_chat.info("STM: summary present=%s", True)
+        blocks.append(f"Conversation Summary:\n{summary}")
 
     if memories:
-        log_chat.debug(
-            "Merging %d retrieved memories into context",
-            len(memories),
+        log_chat.debug("Merging %d user memories", len(memories))
+        log_chat.info("LTM: count=%d", len(memories))
+        blocks.append("User Memory:\n" + "\n".join(memories))
+
+    if rag_chunks:
+        log_chat.debug("Merging %d RAG chunks", len(rag_chunks))
+        log_chat.info("RAG: count=%d", len(rag_chunks))
+        blocks.append(
+            "Knowledge Context:\n" + "\n".join([c.get("text", "") for c in rag_chunks])
         )
-        blocks.append("Memory:\n" + "\n".join(memories))
 
     merged = "\n\n".join(blocks)
 
     log_chat.debug(
-        "Final merged context length=%d chars",
+        "Final merged context | sections=%d | length=%d chars",
+        len(blocks),
         len(merged),
     )
 
@@ -352,16 +566,28 @@ def merge_node(state: dict):
 
 
 def chat_node(state: dict):
+    def should_use_tools_for_query(text: str) -> bool:
+        t = (text or "").lower()
+        # Only enable tools for explicit web/external info requests
+        return any(
+            k in t
+            for k in ["search", "web", "online", "latest", "news", "trend", "lookup"]
+        )
+
     system = SystemMessage(
         content=SYSTEM_PROMPT.format(context=state.get("merged_context") or "(empty)")
     )
-    chat_llm_with_tools = chat_llm.bind_tools(tools)
+    user_text = state["messages"][-1].content if state.get("messages") else ""
+
+    # Otherwise, decide tool availability heuristically
+    use_tools = should_use_tools_for_query(user_text)
+    chat_llm_with_tools = chat_llm.bind_tools(tools) if use_tools else chat_llm
     messages = [system] + state["messages"]
     response = chat_llm_with_tools.invoke(messages)
     log_chat.debug("Assistant response generated")
 
     tool_calls = getattr(response, "tool_calls", None)
-    if tool_calls:
+    if tool_calls and use_tools:
         tool_map = {t.name: t for t in tools}
         tool_messages = []
         for call in tool_calls:
@@ -391,8 +617,38 @@ def chat_node(state: dict):
 
         # Ask the model to produce a final answer using tool outputs
         final = chat_llm_with_tools.invoke(messages + [response] + tool_messages)
+        # Append citations if available
+        citations = state.get("rag_context") or []
+        if citations:
+            cite_lines = []
+            for c in citations:
+                src = c.get("source") or c.get("title") or c.get("doc_id")
+                sect = c.get("section")
+                if src and sect:
+                    cite_lines.append(f"- {src} ({sect})")
+                elif src:
+                    cite_lines.append(f"- {src}")
+            if cite_lines:
+                final.content = (
+                    (final.content or "") + "\n\nCitations:\n" + "\n".join(cite_lines)
+                )
         return {"messages": [final]}
 
+    # No tools or tools disabled; still attach citations if RAG was used
+    citations = state.get("rag_context") or []
+    if citations:
+        cite_lines = []
+        for c in citations:
+            src = c.get("source") or c.get("title") or c.get("doc_id")
+            sect = c.get("section")
+            if src and sect:
+                cite_lines.append(f"- {src} ({sect})")
+            elif src:
+                cite_lines.append(f"- {src}")
+        if cite_lines:
+            response.content = (
+                (response.content or "") + "\n\nCitations:\n" + "\n".join(cite_lines)
+            )
     return {"messages": [response]}
 
 
@@ -405,6 +661,7 @@ builder = StateGraph(ChatState)
 builder.add_node("remember", remember_node)
 builder.add_node("retrieve_ltm", retrieve_ltm)
 builder.add_node("summarize", summarize_node)
+builder.add_node("retrieve_rag", retrieve_rag)
 builder.add_node("merge", merge_node)
 builder.add_node("chat", chat_node)
 
@@ -413,7 +670,8 @@ builder.add_conditional_edges(
     "remember", should_summarize, {True: "summarize", False: "retrieve_ltm"}
 )
 builder.add_edge("summarize", "retrieve_ltm")
-builder.add_edge("retrieve_ltm", "merge")
+builder.add_edge("retrieve_ltm", "retrieve_rag")
+builder.add_edge("retrieve_rag", "merge")
 builder.add_edge("merge", "chat")
 builder.add_edge("chat", END)
 
@@ -428,6 +686,9 @@ def main():
     thread_id = f"{user_id}:{raw_thread_id}"
 
     ensure_user_thread(user_id, thread_id)
+
+    # Preload RAG cache (BM25 + vectors)
+    load_rag_cache()
 
     with (
         PostgresSaver.from_conn_string(DB_URI_STM) as checkpointer,
