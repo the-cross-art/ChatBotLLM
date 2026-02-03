@@ -21,6 +21,7 @@ from langchain_core.messages import (
     HumanMessage,
     RemoveMessage,
     ToolMessage,
+    AIMessage,
 )
 from langchain_core.runnables import RunnableConfig
 
@@ -28,6 +29,7 @@ from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.store.postgres import PostgresStore
 from langgraph.store.base import BaseStore
+from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_community.tools import DuckDuckGoSearchRun
 
 
@@ -535,80 +537,36 @@ def merge_node(state: dict):
     return {"merged_context": merged}
 
 
-def chat_node(state: dict):
+def agent_node(state: dict):
     system = SystemMessage(
         content=SYSTEM_PROMPT.format(context=state.get("merged_context") or "(empty)")
     )
-    # Always bind tools; let the LLM decide whether to call them
-    chat_llm_with_tools = chat_llm.bind_tools(tools)
-    messages = [system] + state["messages"]
-    response = chat_llm_with_tools.invoke(messages)
-    log_chat.debug("Assistant response generated")
-
-    tool_calls = getattr(response, "tool_calls", None)
-    if tool_calls:
-        tool_map = {t.name: t for t in tools}
-        tool_messages = []
-        for call in tool_calls:
-            name = call.get("name")
-            args = call.get("args") or {}
-            call_id = call.get("id")
-            log_tools.info("Tool call: name=%s args=%s", name, args)
-
-            tool = tool_map.get(name)
-            if not tool:
-                log_tools.error("Unknown tool requested: %s", name)
-                continue
-
-            # DuckDuckGoSearchRun expects a string query
-            tool_input = args.get("query") if isinstance(args, dict) else args
-            try:
-                result = tool.invoke(tool_input)
-                result_text = str(result)
-                log_tools.info(
-                    "Tool result (%s): %.200s", name, result_text.replace("\n", " ")
-                )
-                tool_messages.append(
-                    ToolMessage(content=result_text, tool_call_id=call_id, name=name)
-                )
-            except Exception as e:
-                log_tools.error("Tool execution failed (%s)", name, exc_info=e)
-
-        # Ask the model to produce a final answer using tool outputs
-        final = chat_llm_with_tools.invoke(messages + [response] + tool_messages)
-        # Append citations if available
-        citations = state.get("rag_context") or []
-        if citations:
-            cite_lines = []
-            for c in citations:
-                src = c.get("source") or c.get("title") or c.get("doc_id")
-                sect = c.get("section")
-                if src and sect:
-                    cite_lines.append(f"- {src} ({sect})")
-                elif src:
-                    cite_lines.append(f"- {src}")
-            if cite_lines:
-                final.content = (
-                    (final.content or "") + "\n\nCitations:\n" + "\n".join(cite_lines)
-                )
-        return {"messages": [final]}
-
-    # No tools or tools disabled; still attach citations if RAG was used
-    citations = state.get("rag_context") or []
-    if citations:
-        cite_lines = []
-        for c in citations:
-            src = c.get("source") or c.get("title") or c.get("doc_id")
-            sect = c.get("section")
-            if src and sect:
-                cite_lines.append(f"- {src} ({sect})")
-            elif src:
-                cite_lines.append(f"- {src}")
-        if cite_lines:
-            response.content = (
-                (response.content or "") + "\n\nCitations:\n" + "\n".join(cite_lines)
-            )
+    messages = [system] + state.get("messages", [])
+    # Bind tools so the LLM can decide to call them
+    response = chat_llm.bind_tools(tools).invoke(messages)
+    log_chat.debug("Agent produced a message")
     return {"messages": [response]}
+
+
+def finalize_node(state: dict):
+    # Append citations to the last assistant message if any RAG context was used
+    citations = state.get("rag_context") or []
+    if not citations or not state.get("messages"):
+        return {}
+    last_msg = state["messages"][-1]
+    content = getattr(last_msg, "content", "") or ""
+    cite_lines = []
+    for c in citations:
+        src = c.get("source") or c.get("title") or c.get("doc_id")
+        sect = c.get("section")
+        if src and sect:
+            cite_lines.append(f"- {src} ({sect})")
+        elif src:
+            cite_lines.append(f"- {src}")
+    if not cite_lines:
+        return {}
+    new_content = content + "\n\nCitations:\n" + "\n".join(cite_lines)
+    return {"messages": [RemoveMessage(id=last_msg.id), AIMessage(content=new_content)]}
 
 
 # ============================================================
@@ -622,8 +580,10 @@ builder.add_node("retrieve_ltm", retrieve_ltm)
 builder.add_node("summarize", summarize_node)
 builder.add_node("retrieve_rag", retrieve_rag)
 builder.add_node("merge", merge_node)
-builder.add_node("chat", chat_node)
+builder.add_node("agent", agent_node)
 builder.add_node("route_retrieval", route_retrieval_node)
+builder.add_node("tools", ToolNode(tools))
+builder.add_node("finalize", finalize_node)
 
 builder.add_edge(START, "remember")
 builder.add_conditional_edges(
@@ -634,8 +594,12 @@ builder.add_edge("route_retrieval", "retrieve_ltm")
 builder.add_edge("route_retrieval", "retrieve_rag")
 builder.add_edge("retrieve_ltm", "merge")
 builder.add_edge("retrieve_rag", "merge")
-builder.add_edge("merge", "chat")
-builder.add_edge("chat", END)
+builder.add_edge("merge", "agent")
+builder.add_conditional_edges(
+    "agent", tools_condition, {"tools": "tools", "__end__": "finalize"}
+)
+builder.add_edge("tools", "agent")
+builder.add_edge("finalize", END)
 
 # ============================================================
 # MAIN
