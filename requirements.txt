@@ -82,3 +82,6 @@ psycopg2-binary
 rank-bm25
 pypdf
 duckduckgo-search
+fastapi
+uvicorn
+websockets
